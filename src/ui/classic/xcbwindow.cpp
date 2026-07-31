@@ -24,23 +24,31 @@
 
 namespace fcitx::classicui {
 
-XCBWindow::XCBWindow(XCBUI *ui, int width, int height) : ui_(ui) {
+XCBWindow::XCBWindow(XCBUI *ui, int width, int height)
+    : ui_(ui), screenNumber_(ui->defaultScreen()) {
     Window::resize(width, height);
 }
 
 XCBWindow::~XCBWindow() { destroyWindow(); }
 
-void XCBWindow::createWindow(xcb_visualid_t vid, bool overrideRedirect) {
+void XCBWindow::createWindow(xcb_visualid_t vid, bool overrideRedirect,
+                             int screenNumber) {
     auto *conn = ui_->connection();
 
     if (wid_) {
         destroyWindow();
     }
-    xcb_screen_t *screen = xcb_aux_get_screen(conn, ui_->defaultScreen());
+    if (screenNumber >= 0) {
+        screenNumber_ = screenNumber;
+    }
+    xcb_screen_t *screen = xcb_aux_get_screen(conn, screenNumber_);
 
     xcb_colormap_t colorMap;
-    CLASSICUI_DEBUG() << "Create window with vid: " << vid;
-    if (vid == ui_->visualId()) {
+    CLASSICUI_DEBUG() << "Create window with vid: " << vid
+                      << " on screen: " << screenNumber_;
+    // The shared colormap belongs to the default screen; a colormap is only
+    // valid for windows on the same screen it was created for.
+    if (screenNumber_ == ui_->defaultScreen() && vid == ui_->visualId()) {
         colorMap = ui_->colorMap();
         colorMapNeedFree_ = 0;
         CLASSICUI_DEBUG() << "Use shared color map: " << colorMap;

@@ -61,6 +61,14 @@ public:
     int defaultScreen() const { return defaultScreen_; }
     xcb_colormap_t colorMap() const { return colorMap_; }
     xcb_visualid_t visualId() const;
+    // Number of X screens on this connection ( > 1 in Zaphod mode).
+    int screenCount() const { return screenCount_; }
+    // The X screen that currently has keyboard focus (falls back to the
+    // screen with the pointer, then the default screen).
+    int focusedScreen();
+    // Pick a visual for a window on the given screen, honoring that
+    // screen's own composite manager selection (_NET_WM_CM_Sn).
+    xcb_visualid_t visualIdForScreen(int screenNumber);
     void update(UserInterfaceComponent component,
                 InputContext *inputContext) override;
     void updateCursor(InputContext *inputContext) override;
@@ -72,6 +80,9 @@ public:
 
     const auto &screenRects() { return rects_; }
     int dpiByPosition(int x, int y);
+    // Return the Xft.dpi published on the specified X screen's root window.
+    // Falls back to the existing default-screen DPI policy when unset.
+    int dpiForScreen(int screenNumber);
     int scaledDPI(int dpi);
     const XCBFontOption &fontOption() const { return fontOption_; }
 
@@ -85,6 +96,7 @@ private:
     void readXSettings();
     void initScreen();
     void scheduleUpdateScreen();
+    void refreshFontOption(int screenNumber, xcb_screen_t *screen);
 
     static void destroyCairoDevice(cairo_device_t *device);
 
@@ -96,6 +108,7 @@ private:
     xcb_window_t root_ = XCB_WINDOW_NONE;
     xcb_ewmh_connection_t *ewmh_;
     int defaultScreen_;
+    int screenCount_ = 1;
     xcb_colormap_t colorMap_;
     bool needFreeColorMap_ = false;
     std::unique_ptr<XCBInputWindow> inputWindow_;
@@ -112,7 +125,10 @@ private:
     xcb_atom_t xsettingsWindow_ = XCB_WINDOW_NONE;
     xcb_atom_t xsettingsAtom_ = XCB_ATOM_NONE;
 
+    // fontOption_ remains the default X screen's font options for existing
+    // callers. screenFontOptions_ preserves each root's RESOURCE_MANAGER.
     XCBFontOption fontOption_;
+    std::vector<XCBFontOption> screenFontOptions_;
     int maxDpi_ = -1;
     int primaryDpi_ = -1;
     int screenDpi_ = 96;

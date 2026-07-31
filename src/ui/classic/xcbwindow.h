@@ -25,7 +25,11 @@ public:
     XCBWindow(XCBUI *ui, int width = 1, int height = 1);
     ~XCBWindow();
 
-    void createWindow(xcb_visualid_t vid, bool overrideRedirect = true);
+    // Create the window on the given X screen (Zaphod mode may have more
+    // than one). screenNumber < 0 means keep the current screen (initially
+    // the default screen of the connection).
+    void createWindow(xcb_visualid_t vid, bool overrideRedirect = true,
+                      int screenNumber = -1);
     virtual void postCreateWindow() {}
     void destroyWindow();
     void resize(unsigned int width, unsigned int height) override;
@@ -37,6 +41,7 @@ public:
 
     xcb_window_t wid() const { return wid_; }
     void setScale(double scale);
+    int screenNumber() const { return screenNumber_; }
 
 protected:
     double logicalFromPhysical(double value) const;
@@ -48,6 +53,7 @@ protected:
 
     XCBUI *ui_;
     xcb_window_t wid_ = 0;
+    int screenNumber_ = -1;
     xcb_colormap_t colorMapNeedFree_ = 0;
     xcb_visualid_t vid_ = 0;
     std::unique_ptr<HandlerTableEntry<XCBEventFilter>> eventFilter_;

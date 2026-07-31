@@ -39,6 +39,9 @@ private:
     bool showCandidateMenu(size_t candidateIndex, const Rect &anchor);
     void clearCandidateMenu();
     void repaint();
+    // Move the window to the X screen that has input focus (Zaphod mode).
+    // Returns true if the window was recreated on a different screen.
+    bool updateScreen();
     const Rect *getClosestScreen(const Rect &cursorRect) const;
     int calculatePositionX(const Rect &cursorRect,
                            const Rect *closestScreen) const;
@@ -48,6 +51,10 @@ private:
     xcb_atom_t atomBlur_;
 
     std::unique_ptr<XCBCandidateMenu> candidateMenu_;
+    // Geometry of the X screen this window currently lives on. Used
+    // instead of the default screen's RandR rects when the window is on a
+    // non-default screen.
+    Rect screenRect_;
 };
 
 } // namespace fcitx::classicui

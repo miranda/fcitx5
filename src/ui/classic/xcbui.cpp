@@ -201,6 +201,11 @@ XCBUI::XCBUI(ClassicUI *parent, const std::string &name, xcb_connection_t *conn,
              int defaultScreen)
     : UIInterface("x11:" + name), parent_(parent), displayName_(name),
       conn_(conn), defaultScreen_(defaultScreen) {
+    screenCount_ = xcb_setup_roots_length(xcb_get_setup(conn_));
+    screenFontOptions_.resize(screenCount_);
+    CLASSICUI_DEBUG() << "X connection " << displayName_ << " has "
+                      << screenCount_ << " screen(s), default screen is "
+                      << defaultScreen_;
     ewmh_ = parent_->xcb()->call<IXCBModule::ewmh>(displayName_);
     inputWindow_ = std::make_unique<XCBInputWindow>(this);
     trayWindow_ = std::make_unique<XCBTrayWindow>(this);
@@ -264,10 +269,17 @@ XCBUI::XCBUI(ClassicUI *parent, const std::string &name, xcb_connection_t *conn,
                         readXSettings();
                     }
 
-                    auto *screen = xcb_aux_get_screen(conn_, defaultScreen_);
-                    if (property->window == screen->root &&
-                        property->atom == XCB_ATOM_RESOURCE_MANAGER) {
-                        fontOption_ = forcedDpi(conn_, screen);
+                    if (property->atom == XCB_ATOM_RESOURCE_MANAGER) {
+                        int screenNumber = 0;
+                        for (auto iter = xcb_setup_roots_iterator(
+                                 xcb_get_setup(conn_));
+                             iter.rem;
+                             xcb_screen_next(&iter), ++screenNumber) {
+                            if (property->window == iter.data->root) {
+                                refreshFontOption(screenNumber, iter.data);
+                                break;
+                            }
+                        }
                     }
 
                     break;
@@ -301,12 +313,18 @@ XCBUI::XCBUI(ClassicUI *parent, const std::string &name, xcb_connection_t *conn,
             }));
 
     xcb_screen_t *screen = xcb_aux_get_screen(conn_, defaultScreen_);
-    addEventMaskToWindow(conn_, screen->root,
-                         XCB_EVENT_MASK_STRUCTURE_NOTIFY |
-                             XCB_EVENT_MASK_PROPERTY_CHANGE);
     root_ = screen->root;
-    fontOption_ = forcedDpi(conn_, screen);
-    CLASSICUI_DEBUG() << "Xft.dpi: " << fontOption_.dpi;
+
+    int screenNumber = 0;
+    for (auto iter = xcb_setup_roots_iterator(xcb_get_setup(conn_)); iter.rem;
+         xcb_screen_next(&iter), ++screenNumber) {
+        uint32_t eventMask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+        if (screenNumber == defaultScreen_) {
+            eventMask |= XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+        }
+        addEventMaskToWindow(conn_, iter.data->root, eventMask);
+        refreshFontOption(screenNumber, iter.data);
+    }
     initScreen();
     refreshCompositeManager();
     trayWindow_->initTray();
@@ -317,6 +335,21 @@ XCBUI::~XCBUI() {
     inputWindow_.reset();
     trayWindow_.reset();
     device_.reset();
+}
+
+void XCBUI::refreshFontOption(int screenNumber, xcb_screen_t *screen) {
+    if (!screen || screenNumber < 0 ||
+        static_cast<size_t>(screenNumber) >= screenFontOptions_.size()) {
+        return;
+    }
+
+    screenFontOptions_[screenNumber] = forcedDpi(conn_, screen);
+    if (screenNumber == defaultScreen_) {
+        fontOption_ = screenFontOptions_[screenNumber];
+    }
+
+    CLASSICUI_DEBUG() << "Xft.dpi for screen " << screenNumber << ": "
+                      << screenFontOptions_[screenNumber].dpi;
 }
 
 void XCBUI::initScreen() {
@@ -493,7 +526,9 @@ void XCBUI::refreshCompositeManager() {
     CLASSICUI_DEBUG() << "Refresh color map: " << colorMap_
                       << " vid: " << visualId()
                       << " CompMgr: " << compMgrWindow_;
-    inputWindow_->createWindow(visualId());
+    inputWindow_->createWindow(
+        visualIdForScreen(inputWindow_->screenNumber()),
+        /*overrideRedirect=*/true, inputWindow_->screenNumber());
     // mainWindow_->createWindow();
 }
 
@@ -699,6 +734,73 @@ xcb_visualid_t XCBUI::visualId() const {
     return screen->root_visual;
 }
 
+xcb_visualid_t XCBUI::visualIdForScreen(int screenNumber) {
+    if (screenNumber < 0 || screenNumber == defaultScreen_) {
+        return visualId();
+    }
+    xcb_screen_t *screen = xcb_aux_get_screen(conn_, screenNumber);
+    if (!screen) {
+        return visualId();
+    }
+    // The composite manager selection is per X screen. Only use an ARGB
+    // visual if this screen actually has a running composite manager,
+    // mirroring what visualId() does for the default screen.
+    auto atomName = "_NET_WM_CM_S" + std::to_string(screenNumber);
+    auto atomCookie =
+        xcb_intern_atom(conn_, true, atomName.size(), atomName.c_str());
+    auto atomReply =
+        makeUniqueCPtr(xcb_intern_atom_reply(conn_, atomCookie, nullptr));
+    if (atomReply && atomReply->atom != XCB_ATOM_NONE) {
+        auto ownerCookie = xcb_get_selection_owner(conn_, atomReply->atom);
+        auto ownerReply = makeUniqueCPtr(
+            xcb_get_selection_owner_reply(conn_, ownerCookie, nullptr));
+        if (ownerReply && ownerReply->owner != XCB_WINDOW_NONE) {
+            return findVisual(screen);
+        }
+    }
+    return screen->root_visual;
+}
+
+int XCBUI::focusedScreen() {
+    if (screenCount_ <= 1) {
+        return defaultScreen_;
+    }
+    // Keyboard focus is global to the X server. Find out which screen's
+    // root window the currently focused window belongs to.
+    auto focusCookie = xcb_get_input_focus(conn_);
+    auto focus = makeUniqueCPtr(
+        xcb_get_input_focus_reply(conn_, focusCookie, nullptr));
+    if (focus && focus->focus != XCB_NONE &&
+        focus->focus !=
+            static_cast<xcb_window_t>(XCB_INPUT_FOCUS_POINTER_ROOT)) {
+        auto geomCookie = xcb_get_geometry(conn_, focus->focus);
+        auto geom = makeUniqueCPtr(
+            xcb_get_geometry_reply(conn_, geomCookie, nullptr));
+        if (geom) {
+            int index = 0;
+            for (auto iter = xcb_setup_roots_iterator(xcb_get_setup(conn_));
+                 iter.rem; xcb_screen_next(&iter), ++index) {
+                if (iter.data->root == geom->root) {
+                    return index;
+                }
+            }
+        }
+    }
+    // Focus is None / PointerRoot or the lookup failed; fall back to the
+    // screen that currently contains the pointer.
+    int index = 0;
+    for (auto iter = xcb_setup_roots_iterator(xcb_get_setup(conn_)); iter.rem;
+         xcb_screen_next(&iter), ++index) {
+        auto pointerCookie = xcb_query_pointer(conn_, iter.data->root);
+        auto pointer = makeUniqueCPtr(
+            xcb_query_pointer_reply(conn_, pointerCookie, nullptr));
+        if (pointer && pointer->same_screen) {
+            return index;
+        }
+    }
+    return defaultScreen_;
+}
+
 void XCBUI::update(UserInterfaceComponent component,
                    InputContext *inputContext) {
     if (component == UserInterfaceComponent::InputPanel) {
@@ -727,6 +829,18 @@ int XCBUI::dpiByPosition(int x, int y) {
     }
 
     return scaledDPI(screenDpi);
+}
+
+int XCBUI::dpiForScreen(int screenNumber) {
+    if (screenNumber >= 0 &&
+        static_cast<size_t>(screenNumber) < screenFontOptions_.size()) {
+        int dpi = screenFontOptions_[screenNumber].dpi;
+        if (dpi > 0) {
+            return dpi;
+        }
+    }
+
+    return scaledDPI(-1);
 }
 
 int XCBUI::scaledDPI(int dpi) {
