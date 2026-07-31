@@ -141,6 +141,7 @@ public:
           serverWindow_(0) {
         xcb_screen_t *screen = xcb_aux_get_screen(conn, defaultScreen);
         root_ = screen->root;
+        screenCount_ = xcb_setup_roots_length(xcb_get_setup(conn));
         serverWindow_ = xcb_generate_id(conn);
         xcb_create_window(
             conn, XCB_COPY_FROM_PARENT, serverWindow_, screen->root, 0, 0, 1, 1,
@@ -208,6 +209,8 @@ public:
     auto im() { return im_.get(); }
     auto conn() { return conn_; }
     auto root() const { return root_; }
+    // Number of X screens on this connection ( > 1 in Zaphod mode).
+    int screenCount() const { return screenCount_; }
     auto ewmh() { return ewmh_; }
     auto focusGroup() { return group_; }
     auto xkbState() {
@@ -248,6 +251,7 @@ private:
     XIMModule *parent_;
     UniqueCPtr<xcb_im_t, xcb_im_destroy> im_;
     xcb_window_t root_;
+    int screenCount_ = 1;
     xcb_window_t serverWindow_;
     xcb_ewmh_connection_t *ewmh_;
     std::unique_ptr<HandlerTableEntry<XCBEventFilter>> filter_;
@@ -308,10 +312,31 @@ public:
         if (!w) {
             return;
         }
+        // The client window may live on a different X screen than the XIM
+        // server window (Zaphod mode), and translating coordinates between
+        // windows on different screens yields (0, 0) - so on a multi-screen
+        // connection, translate to the client window's own root. Learning
+        // that root costs an extra round trip that cannot be pipelined (the
+        // translate request takes it as an argument), so a single-screen
+        // connection skips it: its only root IS server_->root(). The
+        // fallback branch fetches the geometry regardless, exactly as
+        // before, because it needs the window height.
+        xcb_window_t root = server_->root();
+        UniqueCPtr<xcb_get_geometry_reply_t> geo_reply;
+        if (server_->screenCount() > 1 ||
+            !(mask & (XCB_XIM_XNArea_MASK | XCB_XIM_XNSpotLocation_MASK))) {
+            auto getgeo_cookie = xcb_get_geometry(server_->conn(), w);
+            geo_reply = makeUniqueCPtr(xcb_get_geometry_reply(
+                server_->conn(), getgeo_cookie, nullptr));
+            if (!geo_reply) {
+                return;
+            }
+            root = geo_reply->root;
+        }
         if (mask & XCB_XIM_XNArea_MASK) {
             auto a = xcb_im_input_context_get_preedit_attr(xic_)->area;
-            auto trans_cookie = xcb_translate_coordinates(
-                server_->conn(), w, server_->root(), a.x, a.y);
+            auto trans_cookie =
+                xcb_translate_coordinates(server_->conn(), w, root, a.x, a.y);
             auto reply = makeUniqueCPtr(xcb_translate_coordinates_reply(
                 server_->conn(), trans_cookie, nullptr));
             if (!reply) {
@@ -322,8 +347,8 @@ public:
                               .setSize(a.width, a.height));
         } else if (mask & XCB_XIM_XNSpotLocation_MASK) {
             auto p = xcb_im_input_context_get_preedit_attr(xic_)->spot_location;
-            auto trans_cookie = xcb_translate_coordinates(
-                server_->conn(), w, server_->root(), p.x, p.y);
+            auto trans_cookie =
+                xcb_translate_coordinates(server_->conn(), w, root, p.x, p.y);
             auto reply = makeUniqueCPtr(xcb_translate_coordinates_reply(
                 server_->conn(), trans_cookie, nullptr));
             if (!reply) {
@@ -332,14 +357,8 @@ public:
             setCursorRect(
                 Rect().setPosition(reply->dst_x, reply->dst_y).setSize(0, 0));
         } else {
-            auto getgeo_cookie = xcb_get_geometry(server_->conn(), w);
-            auto reply = makeUniqueCPtr(xcb_get_geometry_reply(
-                server_->conn(), getgeo_cookie, nullptr));
-            if (!reply) {
-                return;
-            }
-            auto trans_cookie = xcb_translate_coordinates(
-                server_->conn(), w, server_->root(), 0, 0);
+            auto trans_cookie =
+                xcb_translate_coordinates(server_->conn(), w, root, 0, 0);
             auto trans_reply = makeUniqueCPtr(xcb_translate_coordinates_reply(
                 server_->conn(), trans_cookie, nullptr));
             if (!trans_reply) {
@@ -348,7 +367,8 @@ public:
 
             setCursorRect(Rect()
                               .setPosition(trans_reply->dst_x,
-                                           trans_reply->dst_y + reply->height)
+                                           trans_reply->dst_y +
+                                               geo_reply->height)
                               .setSize(0, 0));
         }
     }
