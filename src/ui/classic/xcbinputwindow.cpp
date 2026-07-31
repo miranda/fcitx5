@@ -33,6 +33,11 @@ XCBInputWindow::XCBInputWindow(XCBUI *ui)
           ui_->displayName(), "_KDE_NET_WM_BLUR_BEHIND_REGION", false)) {}
 
 void XCBInputWindow::postCreateWindow() {
+    if (xcb_screen_t *screen =
+            xcb_aux_get_screen(ui_->connection(), screenNumber())) {
+        screenRect_ =
+            Rect(0, 0, screen->width_in_pixels, screen->height_in_pixels);
+    }
     if (ui_->ewmh()->_NET_WM_WINDOW_TYPE_COMBO &&
         ui_->ewmh()->_NET_WM_WINDOW_TYPE) {
         xcb_ewmh_set_wm_window_type(ui_->ewmh(), wid_, 1,
@@ -55,7 +60,25 @@ void XCBInputWindow::postCreateWindow() {
             XCB_EVENT_MASK_LEAVE_WINDOW);
 }
 
+bool XCBInputWindow::updateScreen() {
+    int screen = ui_->focusedScreen();
+    if (screen < 0 || screen == screenNumber()) {
+        return false;
+    }
+    CLASSICUI_DEBUG() << "Input window moves to screen " << screen;
+    createWindow(ui_->visualIdForScreen(screen), /*overrideRedirect=*/true,
+                 screen);
+    return true;
+}
+
 const Rect *XCBInputWindow::getClosestScreen(const Rect &cursorRect) const {
+    // On a non-default X screen (Zaphod mode), screenRects() describes the
+    // outputs of the default screen and cursorRect is relative to this
+    // screen's root; constrain against this screen's geometry instead.
+    if (screenNumber() != ui_->defaultScreen()) {
+        return &screenRect_;
+    }
+
     const Rect *closestScreen = nullptr;
 
     int shortestDistance = INT_MAX;
@@ -168,8 +191,16 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
 }
 
 void XCBInputWindow::updateDPI(InputContext *inputContext) {
-    auto dpi = ui_->dpiByPosition(inputContext->cursorRect().left(),
-                                  inputContext->cursorRect().top());
+    int dpi;
+    if (ui_->screenCount() > 1) {
+        // Each X screen has its own RESOURCE_MANAGER root property. In
+        // Zaphod mode, use that screen's explicit Xft.dpi value.
+        dpi = ui_->dpiForScreen(screenNumber());
+    } else {
+        dpi = ui_->dpiByPosition(inputContext->cursorRect().left(),
+                                 inputContext->cursorRect().top());
+    }
+
     setScale(scaleForDPI(dpi));
 }
 
@@ -178,7 +209,10 @@ void XCBInputWindow::update(InputContext *inputContext) {
         return;
     }
     auto oldVisible = visible();
+    bool screenChanged = false;
     if (inputContext) {
+        // In Zaphod mode, follow the input focus to the right X screen.
+        screenChanged = updateScreen();
         updateDPI(inputContext);
     }
     auto [width, height] = InputWindow::update(inputContext);
@@ -192,9 +226,13 @@ void XCBInputWindow::update(InputContext *inputContext) {
 
     auto oldPhysicalWidth = physicalWidth_;
     auto oldPhysicalHeight = physicalHeight_;
+    // Always resize: the logical dimensions may be unchanged while a DPI
+    // change alters the physical dimensions.
     resize(width, height);
+    // The blur property lives on the window, so it also needs to be set
+    // again after the window was recreated on another screen.
     if (physicalWidth_ != oldPhysicalWidth ||
-        physicalHeight_ != oldPhysicalHeight) {
+        physicalHeight_ != oldPhysicalHeight || screenChanged) {
         if (atomBlur_) {
             Rect logicalRect(0, 0, width, height);
             shrink(logicalRect, *ui_->parent()->theme().inputPanel->blurMargin);
@@ -234,7 +272,8 @@ void XCBInputWindow::update(InputContext *inputContext) {
 
     updatePosition(inputContext);
     repaint();
-    if (!oldVisible) {
+    if (!oldVisible || screenChanged) {
+        // A recreated window starts unmapped even if it was visible before.
         xcb_map_window(ui_->connection(), wid_);
     }
 }
